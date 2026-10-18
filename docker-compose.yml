@@ -22,14 +22,20 @@ services:
       MCP_SERVER_NAME: dolibarr-mcp
       MCP_SERVER_VERSION: 1.0.0
 
-    # Expose port for HTTP MCP clients.
-    # Bind to 127.0.0.1 by default: the HTTP listener has no built-in
-    # authentication, so anyone who can reach the port gets full access to
-    # the Dolibarr API through the configured token. For remote access, put
-    # an authenticating reverse proxy (with TLS) in front and adjust the
-    # bind address accordingly.
+    # Published port for HTTP MCP clients.
+    # - Bind address (MCP_BIND): defaults to 127.0.0.1 because the HTTP
+    #   listener has no built-in authentication - anyone who can reach the
+    #   port gets full access to the Dolibarr API through the configured
+    #   token. Set MCP_BIND=0.0.0.0 when another host must route to this
+    #   service (e.g. an ha-proxy or an authenticating reverse proxy with
+    #   TLS in front).
+    # - Host port (MCP_HOST_PORT): defaults to 18004 to avoid conflicts with
+    #   services already using common ports on the host.
+    # - Container port: follows MCP_HTTP_PORT instead of a hardcoded value,
+    #   so the publication stays consistent when the listener port is
+    #   customized.
     ports:
-      - "127.0.0.1:${MCP_HOST_PORT:-18004}:8080"
+      - "${MCP_BIND:-127.0.0.1}:${MCP_HOST_PORT:-18004}:${MCP_HTTP_PORT:-8080}"
 
     # Health check
     healthcheck:
