@@ -1,0 +1,169 @@
+# Integration tests against a real Dolibarr instance, on GitHub Actions.
+# Adapted from mdeweerd/dolibarr-agents (.ci/phpunit.yml, GitLab CI): same
+# MariaDB service, same demo-dump instance setup, same step5.php retag —
+# but no Dockerfile and no registry image. The cache below plays the role
+# of the dolibarr-test image there: the Dolibarr tarball and demo dump are
+# downloaded once per DOLIBARR_TEST_REF and restored from actions/cache on
+# every later run.
+name: integration
+permissions:
+  contents: read
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  # Dolibarr release tag the test instance runs. The demo dump ships at the
+  # .0 of the series; bumping to a later patch is sound only when the branch
+  # carries no x.y.z migration scripts (same rule as dolibarr-agents).
+  DOLIBARR_TEST_REF: "21.0.0"
+  # Max PHP version supported by Dolibarr ${DOLIBARR_TEST_REF}, derived at
+  # runtime from htdocs/install/check.php ($arrayphpmaxversionwarning) into
+  # DOLIBARR_MAX_PHP. The job fails if the installed PHP exceeds it.
+  DOLIBARR_ROOT: /home/runner/dolibarr
+  DB_HOST: 127.0.0.1
+  DB_PORT: "3306"
+  DB_NAME: dolibarr
+  DB_USER: root
+  DB_PASSWORD: dolibarr
+  DOLIBARR_API_KEY: ci-integration-test-key
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      mariadb:
+        image: mariadb:11.4
+        env:
+          MARIADB_ROOT_PASSWORD: ${{ env.DB_PASSWORD }}
+          MARIADB_DATABASE: ${{ env.DB_NAME }}
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # The Dolibarr download IS the cache: keyed on the pinned tag, holding
+      # the extracted sources and the demo dump, so nothing Dolibarr-side is
+      # redone per pipeline unless DOLIBARR_TEST_REF changes.
+      - name: Restore Dolibarr sources and demo dump from cache
+        id: dolibarr-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.DOLIBARR_ROOT }}
+          key: dolibarr-test-${{ env.DOLIBARR_TEST_REF }}-v1
+          restore-keys: |
+            dolibarr-test-${{ env.DOLIBARR_TEST_REF }}-
+
+      - name: Download Dolibarr (cache miss only)
+        if: steps.dolibarr-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          ref="${DOLIBARR_TEST_REF}"
+          maj="${ref%%.*}"
+          mkdir -p "${DOLIBARR_ROOT}"
+          # Resumable and retried: a mid-transfer reset costs the remaining
+          # bytes, not the whole download (same flags as dolibarr-agents).
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors --continue-at - \
+            -o /tmp/dolibarr.tar.gz \
+            "https://github.com/Dolibarr/dolibarr/archive/refs/tags/${ref}.tar.gz"
+          tar -xzf /tmp/dolibarr.tar.gz -C "${DOLIBARR_ROOT}" --strip-components=1
+          rm -f /tmp/dolibarr.tar.gz
+          # The release tarball export-ignores dev/, so the demo dump is
+          # fetched separately from the blob at the same tag.
+          mkdir -p "${DOLIBARR_ROOT}/dev/initdemo"
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors --continue-at - \
+            -o "${DOLIBARR_ROOT}/dev/initdemo/mysqldump_dolibarr_${maj}.0.0.sql" \
+            "https://raw.githubusercontent.com/Dolibarr/dolibarr/${ref}/dev/initdemo/mysqldump_dolibarr_${maj}.0.0.sql"
+
+      # Dolibarr documents its maximum PHP version in htdocs/install/check.php
+      # ($arrayphpmaxversionwarning, e.g. array(8, 3, 0) for the 21.0.0
+      # sources). Extract it the same way Dolibarr's own CI does, so a bump of
+      # DOLIBARR_TEST_REF automatically re-pins the PHP version below.
+      - name: Derive max PHP version from the Dolibarr sources
+        env:
+          DOLIBARR_ROOT: ${{ env.DOLIBARR_ROOT }}
+        run: |
+          max=$(sed -n 's/.*\$arrayphpmaxversionwarning\s*=\s*array\s*(\s*\([0-9]\+\)\s*,\s*\([0-9]\+\).*/\1.\2/p' \
+            "${DOLIBARR_ROOT}/htdocs/install/check.php")
+          if [ -z "${max}" ]; then
+            echo "Could not extract \$arrayphpmaxversionwarning from check.php"
+            exit 1
+          fi
+          echo "DOLIBARR_MAX_PHP=${max}" >> "${GITHUB_ENV}"
+          echo "Dolibarr ${DOLIBARR_TEST_REF} max PHP: ${max}"
+
+      - uses: actions/setup-python@v7
+        with:
+          cache: pip
+          python-version: "3.15"
+      - run: python -m pip install -e .[dev]
+
+      # PHP runs the Dolibarr instance itself (step5.php, the built-in
+      # server), pinned to the max version Dolibarr documents in
+      # htdocs/install/check.php (derived above as DOLIBARR_MAX_PHP).
+      # The ubuntu-latest archive only carries the newest PHP line
+      # (8.5), which exceeds the 21.0.0 cap of 8.3, so the exact version
+      # is installed explicitly.
+      - name: Set up PHP within Dolibarr's max version
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.DOLIBARR_MAX_PHP }}
+          extensions: mysqli, gd, intl, zip, mbstring, curl, xml
+          coverage: none
+      - run: |
+          php -v
+          php -m | grep -ixE 'mysqli|gd|intl|zip|mbstring|curl|xml' | sort
+
+      - name: Enforce Dolibarr max PHP version
+        run: |
+          installed=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+          if php -r 'exit(version_compare(PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION, getenv("DOLIBARR_MAX_PHP"), ">"));'; then
+            echo "OK: PHP ${installed} does not exceed Dolibarr max ${DOLIBARR_MAX_PHP}"
+          else
+            echo "FAIL: PHP ${installed} exceeds Dolibarr max ${DOLIBARR_MAX_PHP} (htdocs/install/check.php)"
+            exit 1
+          fi
+
+      # Through bash on purpose: the executable bit in git never decides
+      # the job (run, not rely).
+      - name: Load demo database and configure the instance
+        run: bash .github/scripts/setup-dolibarr-instance.sh
+
+      - name: Enable REST API and set the CI api key
+        env:
+          DOLIBARR_HTDOCS: ${{ env.DOLIBARR_ROOT }}/htdocs
+        run: php .github/scripts/enable-api.php
+
+      - name: Start Dolibarr
+        run: |
+          set -euo pipefail
+          nohup php -S 127.0.0.1:8080 -t "${DOLIBARR_ROOT}/htdocs" \
+            > php-server.log 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -fsS -o /dev/null "http://127.0.0.1:8080/index.php"; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS -o /dev/null "http://127.0.0.1:8080/index.php"
+
+      - name: Run integration tests against the local instance
+        env:
+          DOLIBARR_URL: http://127.0.0.1:8080/api/index.php
+          DOLIBARR_API_KEY: ${{ env.DOLIBARR_API_KEY }}
+        run: python -m pytest -m integration -v
+
+      - name: Provide server log as artifact
+        uses: actions/upload-artifact@v7
+        if: ${{ ! cancelled() }}
+        with:
+          name: dolibarr-server-log
+          path: php-server.log
+          retention-days: 2

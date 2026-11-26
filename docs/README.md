@@ -1,8 +1,7 @@
 # Documentation
 
-The Dolibarr MCP repository mirrors the documentation layout of the
-`prestashop-mcp` project. Start with the quickstart and branch into specialised
-guides as needed:
+The Dolibarr MCP repository mirrors the documentation layout of the `prestashop-mcp` project. Start with
+the quickstart and branch into specialised guides as needed:
 
 - [Quickstart](quickstart.md) – installation and first run instructions for Linux, macOS and Windows
 - [Configuration](configuration.md) – environment variables consumed by the server

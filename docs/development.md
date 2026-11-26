@@ -1,12 +1,12 @@
 # Development
 
-This project uses the same lightweight tooling philosophy as `prestashop-mcp`.
-The code lives under `src/`, tests under `tests/` and optional Docker assets are
-kept separate in `docker/`.
+This project uses the same lightweight tooling philosophy as `prestashop-mcp`. The code lives under
+`src/`, tests under `tests/` and optional Docker assets are kept separate in `docker/`.
 
 ## Install development dependencies
 
-It is recommended to use a virtual environment to avoid conflicts with system packages (especially on Linux systems with externally managed environments).
+It is recommended to use a virtual environment to avoid conflicts with system packages (especially on
+Linux systems with externally managed environments).
 
 ```bash
 # Create a virtual environment
@@ -35,7 +35,8 @@ To gather coverage metrics:
 pytest --cov=src/dolibarr_mcp --cov-report=term-missing
 ```
 
-If you encounter "command not found" errors, ensure your virtual environment is activated or run via python module:
+If you encounter "command not found" errors, ensure your virtual environment is activated or run via
+python module:
 
 ```bash
 python3 -m pytest
@@ -43,9 +44,8 @@ python3 -m pytest
 
 ### Integration tests
 
-The suite includes a small number of `@pytest.mark.integration` tests that hit a
-real Dolibarr instance. They are skipped by default unless valid credentials are
-present. To run them:
+The suite includes a small number of `@pytest.mark.integration` tests that hit a real Dolibarr instance.
+They are skipped by default unless valid credentials are present. To run them:
 
 ```bash
 export DOLIBARR_URL="https://your-dolibarr.example.com/api/index.php"
@@ -53,27 +53,32 @@ export DOLIBARR_API_KEY="your-api-key"
 pytest -m integration
 ```
 
+CI runs them automatically on every pull request: `.github/workflows/integration.yml` starts a MariaDB
+service, restores a pinned Dolibarr release from `actions/cache` (the download is cached per
+`DOLIBARR_TEST_REF`, no Docker image is built), loads the demo dump, serves the instance with the PHP
+built-in server and runs `pytest -m integration` against it.
+
 ## Formatting and linting
 
-The project intentionally avoids heavy linting dependencies. Follow the coding
-style already present in the repository and run the test-suite before opening a
-pull request.
+The project intentionally avoids heavy linting dependencies. Follow the coding style already present in
+the repository and run the test-suite before opening a pull request.
 
 ## Debugging 500 responses with correlation IDs
 
-Unexpected Dolibarr API failures return a `correlation_id` in the JSON body.
-Include this value when filing issues or investigating user reports.
+Unexpected Dolibarr API failures return a `correlation_id` in the JSON body. Include this value when
+filing issues or investigating user reports.
 
 1. Capture the `correlation_id` from the HTTP 500 response body.
-2. Search the MCP server logs (stdout/stderr) for that ID to locate the full
-   stack trace. For docker users:
+
+2. Search the MCP server logs (stdout/stderr) for that ID to locate the full stack trace. For docker
+   users:
 
    ```bash
    docker logs <container> 2>&1 | grep "<correlation_id>"
    ```
 
-3. The log entry contains the failing endpoint and sanitized payload details.
-   Avoid logging `DOLAPIKEY` or other secrets in bug reports.
+3. The log entry contains the failing endpoint and sanitized payload details. Avoid logging `DOLAPIKEY`
+   or other secrets in bug reports.
 
 ## Docker tooling
 

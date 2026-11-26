@@ -1,7 +1,7 @@
 # Quickstart
 
-Follow these steps to install and run the Dolibarr MCP server. The process
-mirrors the streamlined developer experience of the `prestashop-mcp` project.
+Follow these steps to install and run the Dolibarr MCP server. The process mirrors the streamlined
+developer experience of the `prestashop-mcp` project.
 
 ## 1. Clone the repository
 
@@ -46,9 +46,8 @@ pip install -e .`[dev`]
 
 ## 4. Configure credentials
 
-Create a `.env` file in the project root (see
-[`configuration.md`](configuration.md)) or export the variables within your MCP
-host application.
+Create a `.env` file in the project root (see [`configuration.md`](configuration.md)) or export the
+variables within your MCP host application.
 
 ## 5. Run the server
 
@@ -56,10 +55,9 @@ host application.
 python -m dolibarr_mcp.dolibarr_mcp_server
 ```
 
-The command starts the STDIO based MCP server that Claude Desktop and other
-clients can communicate with. When wiring the server into Claude Desktop, set
-`command` to the path returned by `Get-Command python` (Windows PowerShell) or
-`which python` (Linux/macOS) while the virtual environment is activated, and use
+The command starts the STDIO based MCP server that Claude Desktop and other clients can communicate with.
+When wiring the server into Claude Desktop, set `command` to the path returned by `Get-Command python`
+(Windows PowerShell) or `which python` (Linux/macOS) while the virtual environment is activated, and use
 the arguments `-m dolibarr_mcp.dolibarr_mcp_server`.
 
 ## 6. (Optional) Test the connection
@@ -75,4 +73,3 @@ Override the URL or API key directly when needed:
 ```bash
 python -m dolibarr_mcp.test_connection --url https://your-dolibarr.example.com/api/index.php --api-key YOUR_API_KEY
 ```
-

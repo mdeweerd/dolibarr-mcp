@@ -1,40 +1,39 @@
 # Dolibarr API Coverage
 
 This server wraps the Dolibarr REST API v21.0.1 that is exposed by an instance at
-`https://db.ginos.cloud/api/index.php`. The MCP tools use the following REST
-resources, mirroring the scope that the sibling `prestashop-mcp` project
-implements for PrestaShop.
+`https://db.ginos.cloud/api/index.php`. The MCP tools use the following REST resources, mirroring the
+scope that the sibling `prestashop-mcp` project implements for PrestaShop.
 
 ## Authentication and Conventions
 
-- **Header** – send the `DOLAPIKEY` header with the personal access token that is
-  configured for your Dolibarr user.
-- **Content Type** – every request uses `application/json` payloads and
-  responses.
-- **Pagination** – list endpoints accept the `limit`, `sortfield`, `sortorder`
-  and `sqlfilters` query parameters.
-- **Identifiers** – Dolibarr returns both `id` (numeric) and `ref` (business
-  reference) for most entities. The MCP tools expose both values to the client.
+- **Header** – send the `DOLAPIKEY` header with the personal access token that is configured for your
+  Dolibarr user.
+- **Content Type** – every request uses `application/json` payloads and responses.
+- **Pagination** – list endpoints accept the `limit`, `sortfield`, `sortorder` and `sqlfilters` query
+  parameters.
+- **Identifiers** – Dolibarr returns both `id` (numeric) and `ref` (business reference) for most
+  entities. The MCP tools expose both values to the client.
 
 ## Supported Resources
 
-| Resource        | Endpoint(s)                 | Tool group                              |
-| --------------- | --------------------------- | --------------------------------------- |
-| Status          | `GET /status`               | `get_status`, `test_connection`         |
-| Search          | `/products`, `/thirdparties`| `search_products_by_ref`, `search_customers`, `resolve_product_ref` |
-| Users           | `/users`                    | CRUD helpers under the *Users* group    |
-| Third parties   | `/thirdparties`             | Customer CRUD operations                |
-| Products        | `/products`                 | Product CRUD operations                 |
-| Invoices        | `/invoices`                 | Invoice CRUD operations                 |
-| Orders          | `/orders`                   | Order CRUD operations                   |
-| Projects        | `/projects`                 | Project CRUD operations & Search        |
-| Contacts        | `/contacts`                 | Contact CRUD operations                 |
-| Raw passthrough | Any relative path           | `dolibarr_raw_api` tool for quick tests |
+| Resource        | Endpoint(s)                         | Tool group                                                                                                             |
+| --------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| Status          | `GET /status`                       | `get_status`, `test_connection`                                                                                        |
+| Search          | `/products`, `/thirdparties`        | `search_products_by_ref`, `search_customers`, `resolve_product_ref`                                                    |
+| Users           | `/users`                            | CRUD helpers under the *Users* group                                                                                   |
+| Third parties   | `/thirdparties`                     | Customer CRUD operations                                                                                               |
+| Products        | `/products`                         | Product CRUD operations                                                                                                |
+| Invoices        | `/invoices`                         | Invoice CRUD operations                                                                                                |
+| Orders          | `/orders`                           | Order CRUD operations                                                                                                  |
+| Projects        | `/projects`                         | Project CRUD operations & Search                                                                                       |
+| Contacts        | `/contacts`                         | Contact CRUD operations                                                                                                |
+| Documents       | `/documents`, `/documents/download` | `get_documents` (list attached files), `download_document` (file as embedded resource + embedded Factur-X XML as text) |
+| Tickets         | `/tickets`                          | `get_tickets`, `get_ticket_by_ref`, `search_tickets`, `create_ticket`, `add_ticket_message`, `update_ticket`           |
+| Raw passthrough | Any relative path                   | `dolibarr_raw_api` tool for quick tests (disabled unless `MCP_ENABLE_RAW_API=true`)                                    |
 
-Every endpoint supports create, read, update and delete operations unless noted
-otherwise. The Dolibarr instance that informed this reference currently contains
-live data for users, third parties and contacts; other modules respond with
-empty lists until records are created.
+Every endpoint supports create, read, update and delete operations unless noted otherwise. The Dolibarr
+instance that informed this reference currently contains live data for users, third parties and contacts;
+other modules respond with empty lists until records are created.
 
 ## Response Examples
 
@@ -71,8 +70,8 @@ empty lists until records are created.
 
 ### Structured Error Shapes
 
-The MCP server and wrapper normalize Dolibarr errors into predictable JSON so
-callers can surface actionable messages and debugging breadcrumbs.
+The MCP server and wrapper normalize Dolibarr errors into predictable JSON so callers can surface
+actionable messages and debugging breadcrumbs.
 
 #### Validation errors (`400`)
 
@@ -81,9 +80,15 @@ callers can surface actionable messages and debugging breadcrumbs.
   "error": "Bad Request",
   "status": 400,
   "message": "Validation failed",
-  "missing_fields": ["ref", "socid"],
+  "missing_fields": [
+    "ref",
+    "socid"
+  ],
   "invalid_fields": [
-    { "field": "price", "message": "must be a positive number" }
+    {
+      "field": "price",
+      "message": "must be a positive number"
+    }
   ],
   "endpoint": "/api/index.php/products",
   "timestamp": "2026-01-02T12:34:56Z"
@@ -114,47 +119,66 @@ callers can surface actionable messages and debugging breadcrumbs.
 }
 ```
 
-Include the `correlation_id` from a 500 response when opening support tickets
-so logs can be located quickly.
+Include the `correlation_id` from a 500 response when opening support tickets so logs can be located
+quickly.
 
 ### Create Endpoint Requirements & Examples
 
 The wrapper validates payloads before sending them to Dolibarr. Required fields:
 
-| Endpoint | Required fields | Notes |
-| --- | --- | --- |
-| `POST /products` | `ref`, `label`, `type`, `price` | `type` accepts `product`/`0` or `service`/`1`. |
-| `POST /projects` | `ref`, `name`, `socid` | `title` is accepted as an alias for `name`. |
-| `POST /invoices` | `socid` | Provide `lines` for invoice content. |
-| `POST /time` (timesheets) | `ref`, `task_id`, `duration`, `fk_project` | Provide `ref` or enable auto-generation. |
+| Endpoint                  | Required fields                            | Notes                                          |
+| ------------------------- | ------------------------------------------ | ---------------------------------------------- |
+| `POST /products`          | `ref`, `label`, `type`, `price`            | `type` accepts `product`/`0` or `service`/`1`. |
+| `POST /projects`          | `ref`, `name`, `socid`                     | `title` is accepted as an alias for `name`.    |
+| `POST /invoices`          | `socid`                                    | Provide `lines` for invoice content.           |
+| `POST /time` (timesheets) | `ref`, `task_id`, `duration`, `fk_project` | Provide `ref` or enable auto-generation.       |
 
 #### Example: product create without `ref` (expected 400)
 
 ```bash
 curl -X POST "https://dolibarr.example/api/index.php/products" \
-  -H "DOLAPIKEY: <REDACTED>" \
-  -H "Content-Type: application/json" \
-  -d '{"label":"Freelance hourly rate test — Gino test","type":"service","price":110.00,"tva_tx":19.0}'
+    -H "DOLAPIKEY: <REDACTED>" \
+    -H "Content-Type: application/json" \
+    -d '{"label":"Freelance hourly rate test — Gino test","type":"service","price":110.00,"tva_tx":19.0}'
 ```
 
 #### Example: corrected product payload
 
 ```bash
 curl -X POST "https://dolibarr.example/api/index.php/products" \
-  -H "DOLAPIKEY: <REDACTED>" \
-  -H "Content-Type: application/json" \
-  -d '{"ref":"FREELANCE_HOUR_TEST","label":"Freelance hourly rate test — Gino test","type":"service","price":110.00,"tva_tx":19.0}'
+    -H "DOLAPIKEY: <REDACTED>" \
+    -H "Content-Type: application/json" \
+    -d '{"ref":"FREELANCE_HOUR_TEST","label":"Freelance hourly rate test — Gino test","type":"service","price":110.00,"tva_tx":19.0}'
 ```
 
 #### Example: project create (minimal payload)
 
 ```bash
 curl -X POST "https://dolibarr.example/api/index.php/projects" \
-  -H "DOLAPIKEY: <REDACTED>" \
-  -H "Content-Type: application/json" \
-  -d '{"ref":"PERCISION_TEST_PROJECT","name":"Percision test — Project test","socid":8}'
+    -H "DOLAPIKEY: <REDACTED>" \
+    -H "Content-Type: application/json" \
+    -d '{"ref":"PERCISION_TEST_PROJECT","name":"Precision test — Project test","socid":8}'
 ```
 
-If server-side reference auto-generation is enabled, omitting `ref` results in a
-predictable `AUTO_<timestamp>` reference. Otherwise, the wrapper will raise a
-client-side validation error before sending the request.
+If server-side reference auto-generation is enabled, omitting `ref` results in a predictable
+`AUTO_<timestamp>` reference. Otherwise, the wrapper will raise a client-side validation error before
+sending the request.
+
+## Tickets
+
+The ticket tools work with the business reference (the `ref` column, e.g. `TI1046`) rather than the
+internal numeric row id. Note these endpoint specifics:
+
+- **List / search** – `GET /tickets`. The Dolibarr `status` query parameter is unreliable for tickets, so
+  `get_tickets` filters via `sqlfilters` on `t.fk_statut`. Without a status filter it returns open
+  tickets only (excludes `8`=closed and `9`=cancelled). Status codes: `0`=unread, `1`=read, `3`=assigned,
+  `4`=in progress, `5`=waiting for customer, `7`=waiting for helpdesk, `8`=closed, `9`=cancelled.
+- **Read by reference** – `get_ticket_by_ref` calls `GET /tickets/ref/{ref}`. The response includes the
+  `messages` array and the `track_id`.
+- **Create** – `create_ticket` calls `POST /tickets` and requires `subject` and `message`. `socid` links
+  a thirdparty (the `fk_soc` alias is accepted).
+- **Add message** – `add_ticket_message` calls `POST /tickets/messages`. The Dolibarr endpoint requires
+  `track_id` (not the ref). For convenience the tool accepts either `track_id` or `ref`; when only `ref`
+  is given it is resolved to the `track_id` via `GET /tickets/ref/{ref}` first.
+- **Update** – `update_ticket` calls `PUT /tickets/{id}`. This endpoint only accepts the numeric id, so
+  when only a `ref` is supplied the tool resolves it to the internal id first.

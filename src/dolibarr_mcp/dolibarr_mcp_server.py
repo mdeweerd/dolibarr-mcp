@@ -1,52 +1,263 @@
 """Professional Dolibarr MCP Server with comprehensive CRUD operations."""
 
+from __future__ import annotations
+
 import asyncio
+import base64
+import hmac
 import json
-import sys
 import logging
+import sys
 import uuid
-from datetime import datetime
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any
+
+import uvicorn
+from mcp.server import NotificationOptions, Server
 
 # Import MCP components
 from mcp.server.models import InitializationOptions
-from mcp.server import NotificationOptions, Server
 from mcp.server.stdio import stdio_server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp.types import Tool, TextContent
-
-# Import our Dolibarr components
-from .config import Config
-from .dolibarr_client import DolibarrClient, DolibarrAPIError
+from mcp.types import (
+    BlobResourceContents,
+    CallToolResult,
+    EmbeddedResource,
+    TextContent,
+    Tool,
+)
 
 # HTTP transport imports
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import Response
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
-import uvicorn
 
+# Import our Dolibarr components
+from . import __version__
+from .config import Config
+from .dolibarr_client import DolibarrAPIError, DolibarrClient
 
 # Configure logging to stderr so it doesn't interfere with MCP protocol
 logging.basicConfig(
     level=logging.WARNING,  # Reduce noise in MCP communication
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stderr)]
+    handlers=[logging.StreamHandler(sys.stderr)],
 )
 
 # Create server instance
-server = Server("dolibarr-mcp")
+server = Server("dolibarr-mcp", version=__version__)
+
+
+def _error_result(payload: dict) -> CallToolResult:
+    """Wrap an error payload so MCP clients see it as a failed tool call."""
+    return CallToolResult(
+        content=[TextContent(type="text", text=json.dumps(payload, indent=2))],
+        isError=True,
+    )
+
+
+_APOSTROPHES = ("'", "\u2019", "\u2018")
 
 
 def _escape_sqlfilter(value: str) -> str:
-    """Escape single quotes for SQL filters."""
-    return value.replace("'", "''")
+    """Make a user value safe inside a quoted ``like`` value of Dolibarr sqlfilters.
+
+    Dolibarr's sqlfilters cannot match a literal apostrophe: doubled (''),
+    backslash-escaped (\\') or raw, a quote inside the value never matches
+    (checked on Dolibarr 21), so a search for "O'BRIEN" returned 404.
+    Apostrophes (straight or typographic) are replaced by the LIKE single-
+    character wildcard ``_``, which matches the stored apostrophe and also
+    keeps the value from closing the quoted string.
+    """
+    for apostrophe in _APOSTROPHES:
+        value = value.replace(apostrophe, "_")
+    return value
+
+
+INVOICE_LIST_MAX_LIMIT = 200
+INVOICE_SORT_FIELDS = {"date": "t.datef", "ref": "t.ref", "id": "t.rowid"}
+INVOICE_STATUS_LABELS = {0: "draft", 1: "unpaid", 2: "paid", 3: "cancelled"}
+INVOICE_TYPE_LABELS = {0: "standard", 1: "replacement", 2: "credit_note", 3: "deposit"}
+
+
+def _to_iso_date(value: Any) -> str | None:
+    """Convert a Dolibarr timestamp (int or numeric string) to YYYY-MM-DD.
+
+    Dolibarr stores invoice dates as local midnight, so convert in local time:
+    converting to UTC would shift dates one day back in Europe.
+    """
+    if value in (None, ""):
+        return None
+    try:
+        return datetime.fromtimestamp(int(value)).date().isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return str(value)
+
+
+def _to_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _summarize_invoice(invoice: dict[str, Any]) -> dict[str, Any]:
+    """Keep only the fields useful to list invoices (raw objects are ~10 KB each)."""
+    status = _to_int(invoice.get("status", invoice.get("statut")))
+    inv_type = _to_int(invoice.get("type"))
+    return {
+        "id": _to_int(invoice.get("id")),
+        "ref": invoice.get("ref"),
+        "ref_client": invoice.get("ref_client") or None,
+        "socid": _to_int(invoice.get("socid")),
+        "type": INVOICE_TYPE_LABELS.get(inv_type, inv_type) if inv_type is not None else None,
+        "date": _to_iso_date(invoice.get("date")),
+        "due_date": _to_iso_date(invoice.get("date_lim_reglement")),
+        "total_ht": invoice.get("total_ht"),
+        "total_tva": invoice.get("total_tva"),
+        "total_ttc": invoice.get("total_ttc"),
+        "status": INVOICE_STATUS_LABELS.get(status, status) if status is not None else None,
+        "paid": str(invoice.get("paye")) == "1",
+        "remain_to_pay": invoice.get("remaintopay"),
+        "project_id": _to_int(invoice.get("fk_project")),
+    }
+
+
+MAX_DOCUMENT_BYTES = 10 * 1024 * 1024
+_TEXT_MIME_PREFIXES = ("text/",)
+_TEXT_MIME_TYPES = ("application/xml", "application/json")
+
+
+def _summarize_document(doc: dict) -> dict:
+    """Compact view of a /documents entry, with the path download_document expects."""
+    name = doc.get("name")
+    level1 = doc.get("level1name")
+    timestamp = doc.get("date")
+    date_iso = None
+    if isinstance(timestamp, (int, float)) or (isinstance(timestamp, str) and timestamp.isdigit()):
+        date_iso = datetime.fromtimestamp(int(timestamp), timezone.utc).isoformat().replace("+00:00", "Z")
+    return {
+        "name": name,
+        "original_file": f"{level1}/{name}" if level1 else name,
+        "size": doc.get("size"),
+        "date": date_iso,
+        "type": doc.get("type"),
+    }
+
+
+def _extract_pdf_attachments(data: bytes) -> list[dict]:
+    """Return files embedded in a PDF (e.g. Factur-X 'factur-x.xml')."""
+    try:
+        from io import BytesIO
+
+        from pypdf import PdfReader
+    except ImportError:  # pragma: no cover - pypdf is a declared dependency
+        return []
+    try:
+        reader = PdfReader(BytesIO(data))
+        attachments = reader.attachments
+    except Exception as exc:  # malformed PDF: still return the file itself
+        logging.getLogger(__name__).warning("Cannot read PDF attachments: %s", exc)
+        return []
+    extracted = []
+    for filename, contents in attachments.items():
+        for blob in contents:
+            entry = {"name": filename, "size": len(blob)}
+            try:
+                entry["text"] = blob.decode("utf-8")
+            except UnicodeDecodeError:
+                entry["text"] = None
+                entry["note"] = "binary attachment, not returned"
+            extracted.append(entry)
+    return extracted
+
+
+def _document_contents(downloaded: dict, modulepart: str, original_file: str, include_file: bool = True):
+    """Turn a /documents/download response into MCP content blocks."""
+    content_b64 = downloaded.get("content") or ""
+    encoding = downloaded.get("encoding")
+    mime = downloaded.get("content-type") or "application/octet-stream"
+    filename = downloaded.get("filename") or original_file.rsplit("/", 1)[-1]
+
+    raw = base64.b64decode(content_b64) if encoding == "base64" else content_b64.encode("utf-8")
+    if len(raw) > MAX_DOCUMENT_BYTES:
+        return _error_result(
+            {
+                "error": "Payload Too Large",
+                "status": 413,
+                "message": f"'{original_file}' is {len(raw)} bytes (limit {MAX_DOCUMENT_BYTES}).",
+            }
+        )
+
+    is_pdf = mime == "application/pdf" or filename.lower().endswith(".pdf")
+    is_text = mime.startswith(_TEXT_MIME_PREFIXES) or mime in _TEXT_MIME_TYPES
+    embedded = _extract_pdf_attachments(raw) if is_pdf else []
+
+    meta = {
+        "filename": filename,
+        "original_file": original_file,
+        "content_type": mime,
+        "size": len(raw),
+        "embedded_files": [{k: v for k, v in e.items() if k != "text"} for e in embedded],
+    }
+    blocks: list = [TextContent(type="text", text=json.dumps(meta, indent=2))]
+    for entry in embedded:
+        if entry.get("text") is not None:
+            blocks.append(
+                TextContent(
+                    type="text",
+                    text=f"--- embedded file: {entry['name']} ---\n{entry['text']}",
+                )
+            )
+
+    if include_file:
+        if is_text:
+            blocks.append(TextContent(type="text", text=raw.decode("utf-8", errors="replace")))
+        else:
+            blocks.append(
+                EmbeddedResource(
+                    type="resource",
+                    resource=BlobResourceContents(
+                        uri=f"dolibarr://documents/{modulepart}/{original_file}",  # type: ignore[arg-type]
+                        mimeType=mime,
+                        blob=base64.b64encode(raw).decode("ascii"),
+                    ),
+                )
+            )
+    return blocks
+
+
+RAW_API_TOOL = "dolibarr_raw_api"
+_WRITE_PREFIXES = ("create_", "update_", "delete_", "add_", "set_", "validate_")
+
+
+def is_write_tool(name: str) -> bool:
+    """Return True for tools that modify data in Dolibarr."""
+    return name == RAW_API_TOOL or name.startswith(_WRITE_PREFIXES)
+
+
+def is_tool_allowed(name: str, config: Config) -> bool:
+    """Apply read-only and raw-API policies to a tool name."""
+    if name == RAW_API_TOOL and not config.mcp_enable_raw_api:
+        return False
+    if config.mcp_read_only and is_write_tool(name):
+        return False
+    return True
 
 
 @server.list_tools()
 async def handle_list_tools():
-    """List all available tools."""
+    """List the tools allowed by the current configuration."""
+    config = Config()
+    return [tool for tool in _all_tools() if is_tool_allowed(tool.name, config)]
+
+
+def _all_tools():
+    """Full catalogue of tools, before policy filtering."""
     return [
         # System & Info
         Tool(
@@ -59,7 +270,6 @@ async def handle_list_tools():
             description="Get Dolibarr system status and version information",
             inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
         ),
-
         # Search Tools
         Tool(
             name="search_products_by_ref",
@@ -141,14 +351,11 @@ async def handle_list_tools():
             ),
             inputSchema={
                 "type": "object",
-                "properties": {
-                    "ref": {"type": "string", "description": "Exact product reference"}
-                },
+                "properties": {"ref": {"type": "string", "description": "Exact product reference"}},
                 "required": ["ref"],
                 "additionalProperties": False,
             },
         ),
-
         # User Management CRUD
         Tool(
             name="get_users",
@@ -167,7 +374,7 @@ async def handle_list_tools():
                     },
                     "page": {
                         "type": "integer",
-                        "description": "Page number for pagination (default: 1)",
+                        "description": "Page number, starting at 1 (default: 1)",
                         "default": 1,
                     },
                 },
@@ -239,14 +446,11 @@ async def handle_list_tools():
             description="Delete a user",
             inputSchema={
                 "type": "object",
-                "properties": {
-                    "user_id": {"type": "integer", "description": "User ID to delete"}
-                },
+                "properties": {"user_id": {"type": "integer", "description": "User ID to delete"}},
                 "required": ["user_id"],
                 "additionalProperties": False,
             },
         ),
-
         # Customer/Third Party Management CRUD
         Tool(
             name="get_customers",
@@ -265,7 +469,7 @@ async def handle_list_tools():
                     },
                     "page": {
                         "type": "integer",
-                        "description": "Page number for pagination (default: 1)",
+                        "description": "Page number, starting at 1 (default: 1)",
                         "default": 1,
                     },
                 },
@@ -363,7 +567,6 @@ async def handle_list_tools():
                 "additionalProperties": False,
             },
         ),
-
         # Product Management CRUD
         Tool(
             name="get_products",
@@ -457,26 +660,57 @@ async def handle_list_tools():
                 "additionalProperties": False,
             },
         ),
-
         # Invoice Management CRUD
         Tool(
             name="get_invoices",
             description=(
-                "Get a paginated list of invoices from Dolibarr, optionally filtered by status. "
-                "Use this only if you really need a list of many invoices (e.g. overviews, reports). "
-                "Do not use this as a search-by-customer or search-by-reference tool."
+                "List invoices, newest first by default, optionally filtered by customer and/or status. "
+                "To get a customer's latest invoices, resolve the customer's socid first (search_customers) "
+                "and pass it as customer_id. Returns a compact summary per invoice (ref, dates, totals, "
+                "status, remaining amount); use get_invoice_by_id for lines and full details. "
+                "Use page to walk through larger result sets."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "limit": {
+                    "customer_id": {
                         "type": "integer",
-                        "description": "Maximum number of invoices to return (default: 100)",
-                        "default": 100,
+                        "description": "Only invoices of this third party (Dolibarr socid).",
                     },
                     "status": {
                         "type": "string",
-                        "description": "Invoice status filter (draft, unpaid, paid, etc.)",
+                        "enum": ["draft", "unpaid", "paid", "cancelled"],
+                        "description": "Invoice status filter.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of invoices per page (default: 20, max: 200).",
+                        "default": 20,
+                        "minimum": 1,
+                        "maximum": 200,
+                    },
+                    "page": {
+                        "type": "integer",
+                        "description": "Zero-based page number (default: 0).",
+                        "default": 0,
+                        "minimum": 0,
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "enum": ["date", "ref", "id"],
+                        "description": "Sort field (default: date).",
+                        "default": "date",
+                    },
+                    "sort_order": {
+                        "type": "string",
+                        "enum": ["desc", "asc"],
+                        "description": "Sort order (default: desc, newest first).",
+                        "default": "desc",
+                    },
+                    "full": {
+                        "type": "boolean",
+                        "description": "Return the raw Dolibarr objects instead of the compact summary (much larger).",
+                        "default": False,
                     },
                 },
                 "additionalProperties": False,
@@ -585,6 +819,14 @@ async def handle_list_tools():
                         "type": "string",
                         "description": "Due date (YYYY-MM-DD)",
                     },
+                    "cond_reglement_id": {
+                        "type": "integer",
+                        "description": "Payment terms ID (Dolibarr c_payment_term rowid, e.g. the value used on the customer's previous invoices)",
+                    },
+                    "mode_reglement_id": {
+                        "type": "integer",
+                        "description": "Payment method ID (Dolibarr c_paiement id, e.g. the value used on the customer's previous invoices)",
+                    },
                 },
                 "required": ["invoice_id"],
                 "additionalProperties": False,
@@ -605,7 +847,6 @@ async def handle_list_tools():
                 "additionalProperties": False,
             },
         ),
-
         Tool(
             name="create_invoice_draft",
             description=(
@@ -675,7 +916,7 @@ async def handle_list_tools():
         ),
         Tool(
             name="update_invoice_line",
-            description="Update an existing line in a draft invoice.",
+            description="Update an existing line in a draft invoice. Only the given fields change; the others keep their current values.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -766,7 +1007,6 @@ async def handle_list_tools():
                 "additionalProperties": False,
             },
         ),
-
         # Order Management CRUD
         Tool(
             name="get_orders",
@@ -866,7 +1106,6 @@ async def handle_list_tools():
                 "additionalProperties": False,
             },
         ),
-
         # Contact Management CRUD
         Tool(
             name="get_contacts",
@@ -959,7 +1198,6 @@ async def handle_list_tools():
                 "additionalProperties": False,
             },
         ),
-
         # Project Management CRUD
         Tool(
             name="get_projects",
@@ -978,7 +1216,7 @@ async def handle_list_tools():
                     },
                     "page": {
                         "type": "integer",
-                        "description": "Page number for pagination (default: 1)",
+                        "description": "Page number, starting at 1 (default: 1)",
                         "default": 1,
                     },
                     "status": {
@@ -1100,7 +1338,244 @@ async def handle_list_tools():
                 "additionalProperties": False,
             },
         ),
-
+        # Documents
+        Tool(
+            name="get_documents",
+            description=(
+                "List the files attached to a Dolibarr object (generated PDFs, Factur-X PDFs, uploaded files). "
+                "Identify the object by its ref (e.g. 'FA2024-0001') or numeric id. Each entry includes "
+                "'original_file', to pass to download_document."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "modulepart": {
+                        "type": "string",
+                        "description": (
+                            "Object type: invoice, supplier_invoice, order, supplier_order, propal, "
+                            "shipment, contract, thirdparty, product, expensereport, member, user "
+                            "(Dolibarr also accepts its French names: facture, commande, societe...)."
+                        ),
+                    },
+                    "ref": {"type": "string", "description": "Object reference (e.g. 'FA2024-0001')."},
+                    "id": {"type": "integer", "description": "Object numeric id (alternative to ref)."},
+                },
+                "required": ["modulepart"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="download_document",
+            description=(
+                "Download one attached file. PDFs are returned as an embedded resource; files embedded in "
+                "the PDF (e.g. the Factur-X 'factur-x.xml') are extracted and returned as text. Text files "
+                "are returned as text. Use get_documents first to obtain 'original_file'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "modulepart": {
+                        "type": "string",
+                        "description": "Same object type as used with get_documents (e.g. 'invoice').",
+                    },
+                    "original_file": {
+                        "type": "string",
+                        "description": "Relative path from get_documents (e.g. 'FA2024-0001/FA2024-0001_facturx.pdf').",
+                    },
+                    "include_file": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "Return the binary file itself (default true). Set false to get only "
+                        "metadata and extracted embedded files (smaller response).",
+                    },
+                },
+                "required": ["modulepart", "original_file"],
+                "additionalProperties": False,
+            },
+        ),
+        # Ticket Management
+        Tool(
+            name="get_tickets",
+            description=(
+                "Get a list of tickets from Dolibarr. By default only open tickets are returned "
+                "(closed and cancelled tickets are excluded). Optionally filter by a specific status. "
+                "Status codes: 0=unread, 1=read, 3=assigned, 4=in progress, 5=waiting for customer, "
+                "7=waiting for helpdesk, 8=closed, 9=cancelled. "
+                "Do not use this to look up a single ticket by reference (use get_ticket_by_ref) "
+                "or to search by subject/reference (use search_tickets)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of tickets to return (default: 100)",
+                        "default": 100,
+                    },
+                    "page": {
+                        "type": "integer",
+                        "description": "Page number, starting at 1 (default: 1)",
+                        "default": 1,
+                    },
+                    "status": {
+                        "type": "integer",
+                        "description": (
+                            "Optional exact status filter (fk_statut). Omit to return all open "
+                            "tickets. E.g. 4=in progress, 5=waiting for customer, 8=closed."
+                        ),
+                    },
+                },
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="get_ticket_by_ref",
+            description=(
+                "Get the full details of exactly one ticket by its business reference (e.g. 'TI1046'). "
+                "This is the column 'ref' in Dolibarr, NOT the internal numeric row id. "
+                "The response includes the messages array and the track_id required for add_ticket_message."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ref": {
+                        "type": "string",
+                        "description": "Ticket reference, e.g. 'TI1046'.",
+                    }
+                },
+                "required": ["ref"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="search_tickets",
+            description=(
+                "Search tickets by reference, subject or track_id. Use this when you have a partial or "
+                "full term and need to find matching tickets without loading the full ticket list."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search term matched against ticket ref, subject and track_id.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results",
+                        "default": 20,
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="create_ticket",
+            description="Create a new ticket. Requires a subject and an initial message.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "subject": {"type": "string", "description": "Ticket subject/title"},
+                    "message": {
+                        "type": "string",
+                        "description": "Initial ticket message body",
+                    },
+                    "socid": {
+                        "type": "integer",
+                        "description": "Linked thirdparty/customer ID (optional)",
+                    },
+                    "type_code": {
+                        "type": "string",
+                        "description": "Ticket type code, e.g. 'REQUEST', 'ISSUE' (optional)",
+                    },
+                    "category_code": {
+                        "type": "string",
+                        "description": "Ticket category code (optional)",
+                    },
+                    "severity_code": {
+                        "type": "string",
+                        "description": "Ticket severity code, e.g. 'NORMAL' (optional)",
+                    },
+                    "fk_user_assign": {
+                        "type": "integer",
+                        "description": "ID of the user the ticket is assigned to (optional)",
+                    },
+                },
+                "required": ["subject", "message"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="add_ticket_message",
+            description=(
+                "Add a message to an existing ticket. Provide the ticket reference 'ref' (e.g. 'TI1046') "
+                "OR the 'track_id'. If only 'ref' is given the track_id is resolved automatically. "
+                "Prefer 'ref' unless you already know the track_id."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ref": {
+                        "type": "string",
+                        "description": "Ticket reference, e.g. 'TI1046' (alternative to track_id).",
+                    },
+                    "track_id": {
+                        "type": "string",
+                        "description": "Ticket track_id (alternative to ref).",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Message body to add to the ticket",
+                    },
+                    "private": {
+                        "type": "integer",
+                        "description": "1 for an internal/private message, 0 for public (optional)",
+                    },
+                },
+                "required": ["message"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="update_ticket",
+            description=(
+                "Update an existing ticket (e.g. change status, subject or assignment). "
+                "Provide the ticket reference 'ref' (e.g. 'TI1046') OR the numeric 'ticket_id'. "
+                "If only 'ref' is given the internal id is resolved automatically."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ref": {
+                        "type": "string",
+                        "description": "Ticket reference, e.g. 'TI1046' (alternative to ticket_id).",
+                    },
+                    "ticket_id": {
+                        "type": "integer",
+                        "description": "Internal numeric ticket id (alternative to ref).",
+                    },
+                    "subject": {"type": "string", "description": "Updated subject"},
+                    "message": {"type": "string", "description": "Updated message"},
+                    "fk_statut": {
+                        "type": "integer",
+                        "description": (
+                            "New status. 0=unread, 1=read, 3=assigned, 4=in progress, "
+                            "5=waiting for customer, 7=waiting for helpdesk, 8=closed, 9=cancelled."
+                        ),
+                    },
+                    "fk_user_assign": {
+                        "type": "integer",
+                        "description": "ID of the user the ticket is assigned to",
+                    },
+                    "severity_code": {
+                        "type": "string",
+                        "description": "Ticket severity code, e.g. 'NORMAL'",
+                    },
+                },
+                "additionalProperties": False,
+            },
+        ),
         # Raw API Access
         Tool(
             name="dolibarr_raw_api",
@@ -1141,145 +1616,166 @@ async def handle_list_tools():
 @server.call_tool()
 async def handle_call_tool(name: str, arguments: dict):
     """Handle all tool calls using the DolibarrClient."""
-    
+
     try:
         # Initialize the config and client
         config = Config()
-        
+
+        if not is_tool_allowed(name, config):
+            denied = {
+                "error": "Forbidden",
+                "status": 403,
+                "message": f"Tool '{name}' is disabled by server policy " "(MCP_READ_ONLY / MCP_ENABLE_RAW_API).",
+            }
+            return _error_result(denied)
+
         async with DolibarrClient(config) as client:
-            
+
             # System & Info
             if name == "test_connection":
                 result = await client.get_status()
-                if 'success' not in result:
+                if "success" not in result:
                     result = {"status": "success", "message": "API connection working", "data": result}
-            
+
             elif name == "get_status":
                 result = await client.get_status()
-            
+
             # Search Tools
             elif name == "search_products_by_ref":
-                ref_prefix = _escape_sqlfilter(arguments['ref_prefix'])
-                limit = arguments.get('limit', 20)
+                ref_prefix = _escape_sqlfilter(arguments["ref_prefix"])
+                limit = arguments.get("limit", 20)
                 sqlfilters = f"(t.ref:like:'{ref_prefix}%')"
                 result = await client.search_products(sqlfilters=sqlfilters, limit=limit)
 
             elif name == "search_customers":
-                query = _escape_sqlfilter(arguments['query'])
-                limit = arguments.get('limit', 20)
+                query = _escape_sqlfilter(arguments["query"])
+                limit = arguments.get("limit", 20)
                 sqlfilters = f"((t.nom:like:'%{query}%') OR (t.name_alias:like:'%{query}%'))"
                 result = await client.search_customers(sqlfilters=sqlfilters, limit=limit)
 
             elif name == "search_products_by_label":
-                label_search = _escape_sqlfilter(arguments['label_search'])
-                limit = arguments.get('limit', 20)
+                label_search = _escape_sqlfilter(arguments["label_search"])
+                limit = arguments.get("limit", 20)
                 sqlfilters = f"(t.label:like:'%{label_search}%')"
                 result = await client.search_products(sqlfilters=sqlfilters, limit=limit)
 
             elif name == "resolve_product_ref":
-                ref = arguments['ref']
+                ref = arguments["ref"]
                 ref_esc = _escape_sqlfilter(ref)
                 sqlfilters = f"(t.ref:like:'{ref_esc}')"
                 products = await client.search_products(sqlfilters=sqlfilters, limit=2)
-                
+
                 if not products:
                     result = {"status": "not_found", "message": f"Product with ref '{ref}' not found"}
                 elif len(products) == 1:
                     result = {"status": "ok", "product": products[0]}
                 else:
                     # Check if one is exact match
-                    exact_matches = [p for p in products if p.get('ref') == ref]
+                    exact_matches = [p for p in products if p.get("ref") == ref]
                     if len(exact_matches) == 1:
                         result = {"status": "ok", "product": exact_matches[0]}
                     else:
-                        result = {"status": "ambiguous", "message": f"Multiple products found for ref '{ref}'", "products": products}
+                        result = {
+                            "status": "ambiguous",
+                            "message": f"Multiple products found for ref '{ref}'",
+                            "products": products,
+                        }
 
             # User Management
             elif name == "get_users":
-                result = await client.get_users(
-                    limit=arguments.get('limit', 100),
-                    page=arguments.get('page', 1)
-                )
-            
+                result = await client.get_users(limit=arguments.get("limit", 100), page=arguments.get("page", 1))
+
             elif name == "get_user_by_id":
-                result = await client.get_user_by_id(arguments['user_id'])
-            
+                result = await client.get_user_by_id(arguments["user_id"])
+
             elif name == "create_user":
                 result = await client.create_user(**arguments)
-            
+
             elif name == "update_user":
-                user_id = arguments.pop('user_id')
+                user_id = arguments.pop("user_id")
                 result = await client.update_user(user_id, **arguments)
-            
+
             elif name == "delete_user":
-                result = await client.delete_user(arguments['user_id'])
-            
+                result = await client.delete_user(arguments["user_id"])
+
             # Customer Management
             elif name == "get_customers":
-                result = await client.get_customers(
-                    limit=arguments.get('limit', 100),
-                    page=arguments.get('page', 1)
-                )
-            
+                result = await client.get_customers(limit=arguments.get("limit", 100), page=arguments.get("page", 1))
+
             elif name == "get_customer_by_id":
-                result = await client.get_customer_by_id(arguments['customer_id'])
-            
+                result = await client.get_customer_by_id(arguments["customer_id"])
+
             elif name == "create_customer":
                 result = await client.create_customer(**arguments)
-            
+
             elif name == "update_customer":
-                customer_id = arguments.pop('customer_id')
+                customer_id = arguments.pop("customer_id")
                 result = await client.update_customer(customer_id, **arguments)
-            
+
             elif name == "delete_customer":
-                result = await client.delete_customer(arguments['customer_id'])
-            
+                result = await client.delete_customer(arguments["customer_id"])
+
             # Product Management
             elif name == "get_products":
-                result = await client.get_products(limit=arguments.get('limit', 100))
-            
+                result = await client.get_products(limit=arguments.get("limit", 100))
+
             elif name == "get_product_by_id":
-                result = await client.get_product_by_id(arguments['product_id'])
-            
+                result = await client.get_product_by_id(arguments["product_id"])
+
             elif name == "create_product":
                 result = await client.create_product(**arguments)
-            
+
             elif name == "update_product":
-                product_id = arguments.pop('product_id')
+                product_id = arguments.pop("product_id")
                 result = await client.update_product(product_id, **arguments)
-            
+
             elif name == "delete_product":
-                result = await client.delete_product(arguments['product_id'])
-            
+                result = await client.delete_product(arguments["product_id"])
+
             # Invoice Management
             elif name == "get_invoices":
-                result = await client.get_invoices(
-                    limit=arguments.get('limit', 100),
-                    status=arguments.get('status')
+                limit = max(1, min(int(arguments.get("limit", 20)), INVOICE_LIST_MAX_LIMIT))
+                sort_by = arguments.get("sort_by", "date")
+                sort_order = arguments.get("sort_order", "desc")
+                if sort_by not in INVOICE_SORT_FIELDS:
+                    raise ValueError(f"sort_by must be one of {sorted(INVOICE_SORT_FIELDS)}")
+                if sort_order not in ("asc", "desc"):
+                    raise ValueError("sort_order must be 'asc' or 'desc'")
+                invoices = await client.get_invoices(
+                    limit=limit,
+                    status=arguments.get("status"),
+                    customer_id=arguments.get("customer_id"),
+                    page=max(0, int(arguments.get("page", 0))),
+                    sortfield=INVOICE_SORT_FIELDS[sort_by],
+                    sortorder=sort_order.upper(),
                 )
-            
+                if arguments.get("full"):
+                    result = invoices
+                else:
+                    result = [_summarize_invoice(inv) for inv in invoices]
+
             elif name == "get_invoice_by_id":
-                result = await client.get_invoice_by_id(arguments['invoice_id'])
-            
+                result = await client.get_invoice_by_id(arguments["invoice_id"])
+
             elif name == "create_invoice":
                 result = await client.create_invoice(**arguments)
-            
+
             elif name == "update_invoice":
-                invoice_id = arguments.pop('invoice_id')
+                invoice_id = arguments.pop("invoice_id")
                 result = await client.update_invoice(invoice_id, **arguments)
-            
+
             elif name == "delete_invoice":
-                result = await client.delete_invoice(arguments['invoice_id'])
+                result = await client.delete_invoice(arguments["invoice_id"])
 
             elif name == "create_invoice_draft":
                 # Map customer_id to socid for the API
                 if "customer_id" in arguments:
                     arguments["socid"] = arguments.pop("customer_id")
-                
+
                 # Map project_id to fk_project if present
                 if "project_id" in arguments:
                     arguments["fk_project"] = arguments.pop("project_id")
-                
+
                 result = await client.create_invoice(**arguments)
 
             elif name == "add_invoice_line":
@@ -1304,50 +1800,45 @@ async def handle_call_tool(name: str, arguments: dict):
             elif name == "validate_invoice":
                 invoice_id = arguments.pop("invoice_id")
                 result = await client.validate_invoice(invoice_id, **arguments)
-            
+
             # Order Management
             elif name == "get_orders":
-                result = await client.get_orders(
-                    limit=arguments.get('limit', 100),
-                    status=arguments.get('status')
-                )
-            
+                result = await client.get_orders(limit=arguments.get("limit", 100), status=arguments.get("status"))
+
             elif name == "get_order_by_id":
-                result = await client.get_order_by_id(arguments['order_id'])
-            
+                result = await client.get_order_by_id(arguments["order_id"])
+
             elif name == "create_order":
                 result = await client.create_order(**arguments)
-            
+
             elif name == "update_order":
-                order_id = arguments.pop('order_id')
+                order_id = arguments.pop("order_id")
                 result = await client.update_order(order_id, **arguments)
-            
+
             elif name == "delete_order":
-                result = await client.delete_order(arguments['order_id'])
-            
+                result = await client.delete_order(arguments["order_id"])
+
             # Contact Management
             elif name == "get_contacts":
-                result = await client.get_contacts(limit=arguments.get('limit', 100))
-            
+                result = await client.get_contacts(limit=arguments.get("limit", 100))
+
             elif name == "get_contact_by_id":
-                result = await client.get_contact_by_id(arguments['contact_id'])
-            
+                result = await client.get_contact_by_id(arguments["contact_id"])
+
             elif name == "create_contact":
                 result = await client.create_contact(**arguments)
-            
+
             elif name == "update_contact":
-                contact_id = arguments.pop('contact_id')
+                contact_id = arguments.pop("contact_id")
                 result = await client.update_contact(contact_id, **arguments)
-            
+
             elif name == "delete_contact":
-                result = await client.delete_contact(arguments['contact_id'])
-            
+                result = await client.delete_contact(arguments["contact_id"])
+
             # Project Management
             elif name == "get_projects":
                 result = await client.get_projects(
-                    limit=arguments.get("limit", 100),
-                    page=arguments.get("page", 1),
-                    status=arguments.get("status")
+                    limit=arguments.get("limit", 100), page=arguments.get("page", 1), status=arguments.get("status")
                 )
 
             elif name == "get_project_by_id":
@@ -1369,24 +1860,78 @@ async def handle_call_tool(name: str, arguments: dict):
             elif name == "delete_project":
                 result = await client.delete_project(arguments["project_id"])
 
+            # Documents
+            elif name == "get_documents":
+                if not arguments.get("ref") and arguments.get("id") is None:
+                    return _error_result(
+                        {
+                            "error": "Bad Request",
+                            "status": 400,
+                            "message": "Provide either 'ref' or 'id'.",
+                        }
+                    )
+                docs = await client.get_documents(
+                    arguments["modulepart"],
+                    ref=arguments.get("ref"),
+                    id=arguments.get("id"),
+                )
+                result = [_summarize_document(d) for d in docs]
+
+            elif name == "download_document":
+                downloaded = await client.download_document(arguments["modulepart"], arguments["original_file"])
+                return _document_contents(
+                    downloaded,
+                    arguments["modulepart"],
+                    arguments["original_file"],
+                    include_file=arguments.get("include_file", True),
+                )
+
+            # Ticket Management
+            elif name == "get_tickets":
+                result = await client.get_tickets(
+                    limit=arguments.get("limit", 100),
+                    page=arguments.get("page", 1),
+                    status=arguments.get("status"),
+                )
+
+            elif name == "get_ticket_by_ref":
+                result = await client.get_ticket_by_ref(arguments["ref"])
+
+            elif name == "search_tickets":
+                query = _escape_sqlfilter(arguments["query"])
+                limit = arguments.get("limit", 20)
+                sqlfilters = f"((t.ref:like:'%{query}%') OR (t.subject:like:'%{query}%') " f"OR (t.track_id:like:'%{query}%'))"
+                result = await client.search_tickets(sqlfilters=sqlfilters, limit=limit)
+
+            elif name == "create_ticket":
+                result = await client.create_ticket(**arguments)
+
+            elif name == "add_ticket_message":
+                result = await client.add_ticket_message(**arguments)
+
+            elif name == "update_ticket":
+                ticket_id = arguments.pop("ticket_id", None)
+                ref = arguments.pop("ref", None)
+                result = await client.update_ticket(ticket_id=ticket_id, ref=ref, **arguments)
+
             # Raw API Access
             elif name == "dolibarr_raw_api":
                 result = await client.dolibarr_raw_api(**arguments)
-            
+
             else:
                 result = {"error": f"Unknown tool: {name}"}
-        
+
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
-    
+
     except DolibarrAPIError as e:
         error_payload = e.response_data or {
             "error": "Dolibarr API Error",
             "status": e.status_code or 500,
             "message": str(e),
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
-        return [TextContent(type="text", text=json.dumps(error_payload, indent=2))]
-    
+        return _error_result(error_payload)
+
     except Exception as e:
         correlation_id = str(uuid.uuid4())
         error_result = {
@@ -1394,10 +1939,10 @@ async def handle_call_tool(name: str, arguments: dict):
             "status": 500,
             "message": f"Tool execution failed: {str(e)}",
             "correlation_id": correlation_id,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
         print(f"🔥 Tool execution error ({correlation_id}): {e}", file=sys.stderr)  # Debug logging
-        return [TextContent(type="text", text=json.dumps(error_result, indent=2))]
+        return _error_result(error_result)
 
 
 @asynccontextmanager
@@ -1409,7 +1954,7 @@ async def test_api_connection(config: Config | None = None):
         if config is None:
             config = Config()
             created_config = True
-        
+
         # Check if environment variables are set
         if not config.dolibarr_url or config.dolibarr_url == "https://your-dolibarr-instance.com/api/index.php":
             print("⚠️  Warning: DOLIBARR_URL not configured in .env file", file=sys.stderr)
@@ -1417,18 +1962,18 @@ async def test_api_connection(config: Config | None = None):
             print("📝 Please configure your .env file with valid Dolibarr credentials", file=sys.stderr)
             yield False  # Configuration incomplete
             return
-            
+
         if not config.api_key or config.api_key == "your_dolibarr_api_key_here":
             print("⚠️  Warning: DOLIBARR_API_KEY not configured in .env file", file=sys.stderr)
             print("⚠️  API authentication will fail", file=sys.stderr)
             print("📝 Please configure your .env file with valid Dolibarr credentials", file=sys.stderr)
             yield False  # Configuration incomplete
             return
-        
+
         async with DolibarrClient(config) as client:
             print("🧪 Testing Dolibarr API connection...", file=sys.stderr)
             result = await client.get_status()
-            if 'success' in result or 'dolibarr_version' in str(result):
+            if "success" in result or "dolibarr_version" in str(result):
                 print("✅ Dolibarr API connection successful", file=sys.stderr)
                 print("🎯 Full CRUD operations available for all Dolibarr modules", file=sys.stderr)
                 api_ok = True
@@ -1442,7 +1987,7 @@ async def test_api_connection(config: Config | None = None):
             print("💡 Check your .env file configuration", file=sys.stderr)
         print("⚠️  Server will start but API calls may fail", file=sys.stderr)
         api_ok = False
-    
+
     yield api_ok
 
 
@@ -1454,7 +1999,7 @@ async def _run_stdio_server(_config: Config) -> None:
             write_stream,
             InitializationOptions(
                 server_name="dolibarr-mcp",
-                server_version="1.0.1",
+                server_version=__version__,
                 capabilities=server.get_capabilities(
                     notification_options=NotificationOptions(),
                     experimental_capabilities={},
@@ -1463,8 +2008,37 @@ async def _run_stdio_server(_config: Config) -> None:
         )
 
 
-def _build_http_app(session_manager: StreamableHTTPSessionManager) -> Starlette:
+class BearerAuthMiddleware:
+    """Pure ASGI middleware enforcing `Authorization: Bearer <token>`."""
+
+    def __init__(self, app, token: str):
+        self.app = app
+        self.expected = f"Bearer {token}".encode()
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] != "http" or scope.get("method") == "OPTIONS":
+            await self.app(scope, receive, send)
+            return
+        provided = b""
+        for key, value in scope.get("headers", []):
+            if key == b"authorization":
+                provided = value
+                break
+        if not hmac.compare_digest(provided, self.expected):
+            response = Response(
+                '{"error": "Unauthorized"}',
+                status_code=401,
+                media_type="application/json",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+def _build_http_app(session_manager: StreamableHTTPSessionManager, config: Config | None = None) -> Starlette:
     """Create Starlette app that forwards to the StreamableHTTP session manager."""
+    config = config or Config()
 
     class ASGIEndpoint:
         """Lightweight adapter so Route treats our handler as an ASGI app."""
@@ -1475,17 +2049,7 @@ def _build_http_app(session_manager: StreamableHTTPSessionManager) -> Starlette:
         async def __call__(self, scope: Scope, receive: Receive, send: Send):
             await self.handler(scope, receive, send)
 
-    async def options_handler(request):
-        """Lightweight CORS-friendly response for preflight requests."""
-        return Response(
-            status_code=204,
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
-                "Access-Control-Allow-Headers": "*",
-            },
-        )
-
+    @asynccontextmanager
     async def lifespan(app):
         async with session_manager.run():
             yield
@@ -1496,32 +2060,46 @@ def _build_http_app(session_manager: StreamableHTTPSessionManager) -> Starlette:
 
     asgi_endpoint = ASGIEndpoint(asgi_handler)
 
-    app = Starlette(
+    middleware = []
+    origins = config.cors_origins
+    if origins:
+        # CORS only for explicitly allowed origins (MCP_CORS_ORIGINS).
+        middleware.append(
+            Middleware(
+                CORSMiddleware,
+                allow_origins=origins,
+                allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+                allow_headers=["Authorization", "Content-Type", "Accept", "Mcp-Session-Id", "Mcp-Protocol-Version"],
+                expose_headers=["Mcp-Session-Id"],
+                allow_credentials=False,
+            )
+        )
+    if config.mcp_http_token:
+        # Added after CORS so preflight requests are answered before auth.
+        middleware.append(Middleware(BearerAuthMiddleware, token=config.mcp_http_token))
+
+    return Starlette(
         routes=[
             Route("/", asgi_endpoint, methods=["GET", "POST", "DELETE"]),
             Route("/{path:path}", asgi_endpoint, methods=["GET", "POST", "DELETE"]),
-            Route("/", options_handler, methods=["OPTIONS"]),
-            Route("/{path:path}", options_handler, methods=["OPTIONS"]),
         ],
+        middleware=middleware,
         lifespan=lifespan,
     )
-
-    # Allow cross-origin requests from MCP-enabled web UIs and dashboards.
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-        allow_credentials=False,
-    )
-
-    return app
 
 
 async def _run_http_server(config: Config) -> None:
     """Run the MCP server over HTTP (StreamableHTTP)."""
+    if not config.mcp_http_token and not config.http_host_is_loopback:
+        raise RuntimeError(
+            f"Refusing to listen on {config.mcp_http_host} without authentication: "
+            "set MCP_HTTP_TOKEN (or bind MCP_HTTP_HOST to 127.0.0.1)."
+        )
+    if not config.mcp_http_token:
+        print("⚠️  MCP_HTTP_TOKEN not set - HTTP listener is unauthenticated (loopback only)", file=sys.stderr)
+
     session_manager = StreamableHTTPSessionManager(server, json_response=False, stateless=False)
-    app = _build_http_app(session_manager)
+    app = _build_http_app(session_manager, config)
     print(
         f"🌐 Starting MCP HTTP server on {config.mcp_http_host}:{config.mcp_http_port}",
         file=sys.stderr,
@@ -1549,7 +2127,7 @@ async def main():
             print("📝 Configure your .env file to enable API functionality", file=sys.stderr)
         else:
             print("✅ API connection validated", file=sys.stderr)
-    
+
     # Run server regardless of API status
     print("🚀 Starting Professional Dolibarr MCP server...", file=sys.stderr)
     print("✅ Server ready with comprehensive ERP management capabilities", file=sys.stderr)

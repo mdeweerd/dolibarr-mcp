@@ -2,10 +2,11 @@
 
 import os
 import sys
+from typing import List
 
+from dotenv import load_dotenv
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
@@ -45,12 +46,35 @@ class Config(BaseSettings):
 
     mcp_http_host: str = Field(
         description="HTTP host/interface for MCP server",
-        default="0.0.0.0",
+        default="127.0.0.1",
     )
 
     mcp_http_port: int = Field(
         description="HTTP port for MCP server",
         default=8080,
+    )
+
+    mcp_http_token: str = Field(
+        description=(
+            "Bearer token required on every HTTP request (Authorization: Bearer <token>). "
+            "Mandatory when the HTTP listener is not bound to a loopback address."
+        ),
+        default="",
+    )
+
+    mcp_cors_origins: str = Field(
+        description="Comma-separated list of allowed CORS origins (empty = CORS disabled)",
+        default="",
+    )
+
+    mcp_read_only: bool = Field(
+        description="Expose only read tools (no create/update/delete/validate)",
+        default=False,
+    )
+
+    mcp_enable_raw_api: bool = Field(
+        description="Expose the dolibarr_raw_api escape-hatch tool",
+        default=False,
     )
 
     allow_ref_autogen: bool = Field(
@@ -85,9 +109,9 @@ class Config(BaseSettings):
         if not v:
             v = (
                 os.getenv("DOLIBARR_URL")
-                or os.getenv("DOLIBARR_BASE_URL")
-                or os.getenv("DOLIBARR_SHOP_URL")
-                or ""
+                or os.getenv("DOLIBARR_BASE_URL")  # noqa: W503
+                or os.getenv("DOLIBARR_SHOP_URL")  # noqa: W503
+                or ""  # noqa: W503
             )
             if not v:
                 # Print warning but don't fail
@@ -170,7 +194,17 @@ class Config(BaseSettings):
     @classmethod
     def validate_http_host(cls, v: str) -> str:
         """Validate HTTP host."""
-        return v or os.getenv("MCP_HTTP_HOST", "0.0.0.0")
+        return v or os.getenv("MCP_HTTP_HOST", "127.0.0.1")
+
+    @property
+    def cors_origins(self) -> List[str]:
+        """Parsed list of allowed CORS origins."""
+        return [o.strip() for o in str(self.mcp_cors_origins).split(",") if o.strip()]
+
+    @property
+    def http_host_is_loopback(self) -> bool:
+        """True when the HTTP listener is only reachable locally."""
+        return self.mcp_http_host in {"127.0.0.1", "localhost", "::1"}
 
     @field_validator("mcp_http_port")
     @classmethod
@@ -191,15 +225,15 @@ class Config(BaseSettings):
             config = cls(
                 dolibarr_url=(
                     os.getenv("DOLIBARR_URL")
-                    or os.getenv("DOLIBARR_BASE_URL")
-                    or os.getenv("DOLIBARR_SHOP_URL")
-                    or ""
+                    or os.getenv("DOLIBARR_BASE_URL")  # noqa: W503
+                    or os.getenv("DOLIBARR_SHOP_URL")  # noqa: W503
+                    or ""  # noqa: W503
                 ),
                 dolibarr_api_key=os.getenv("DOLIBARR_API_KEY", ""),
                 log_level=os.getenv("LOG_LEVEL", "INFO"),
             )
             if os.getenv("DEBUG_CONFIG"):
-                print(f"✅ Config loaded:", file=sys.stderr)
+                print("✅ Config loaded:", file=sys.stderr)
                 print(f"   URL: {config.dolibarr_url}", file=sys.stderr)
                 print(
                     f"   API Key: {'*' * 10 if config.dolibarr_api_key else 'NOT SET'}",
@@ -237,8 +271,12 @@ class Config(BaseSettings):
         self.dolibarr_api_key = type(self).validate_api_key(self.dolibarr_api_key)
         self.log_level = type(self).validate_log_level(self.log_level)
 
-        if self.dolibarr_url.endswith('your-dolibarr-instance.com/api/index.php') or self.dolibarr_api_key in {'', 'placeholder_api_key', 'your_dolibarr_api_key_here'}:
-            raise ValueError('Dolibarr configuration is incomplete')
+        if self.dolibarr_url.endswith("your-dolibarr-instance.com/api/index.php") or self.dolibarr_api_key in {
+            "",
+            "placeholder_api_key",
+            "your_dolibarr_api_key_here",
+        }:
+            raise ValueError("Dolibarr configuration is incomplete")
 
     @property
     def api_key(self) -> str:
