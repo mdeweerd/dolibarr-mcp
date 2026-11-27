@@ -11,6 +11,6 @@ way to read them.
 
 ## Files
 
-24 per-file wiring cards mirror the source tree under `graft/` (19 carry extracted symbols). They are
+42 per-file wiring cards mirror the source tree under `graft/` (37 carry extracted symbols). They are
 deliberately not enumerated here — `grep` a symbol or `find`/`ls` a filename under `graft/` to land on
 the card for that file.

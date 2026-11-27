@@ -1,7 +1,7 @@
 # tests/integration/test_minimal_creates.py
 
 - dolibarr_api_server · function · L18-L64 — async def dolibarr_api_server(unused_tcp_port: int) ->
-  Tuple[str, Dict, Dict]
+  AsyncGenerator\[Tuple[str, Dict, Dict], None\]
 - create_product · function · L23-L28 — async def create_product(request: web.Request) -> web.Response
 - delete_product · function · L30-L33 — async def delete_product(request: web.Request) -> web.Response
 - create_project · function · L35-L40 — async def create_project(request: web.Request) -> web.Response

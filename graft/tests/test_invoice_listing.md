@@ -12,7 +12,7 @@
 - test_get_invoices_rejects_unknown_sort_field · function · L111-L119 — async def
   test_get_invoices_rejects_unknown_sort_field()
 - \_config · function · L122-L123 — def \_config()
-- test_client_get_invoices_builds_dolibarr_params · function · L127-L144 — async def
+- test_client_get_invoices_builds_dolibarr_params · function · L127-L142 — async def
   test_client_get_invoices_builds_dolibarr_params()
-- test_client_get_invoices_empty_result_on_404 · function · L148-L152 — async def
+- test_client_get_invoices_empty_result_on_404 · function · L146-L150 — async def
   test_client_get_invoices_empty_result_on_404()

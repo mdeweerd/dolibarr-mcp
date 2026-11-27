@@ -48,6 +48,13 @@ Done — `search_products_by_ref`, `search_products_by_label`, `resolve_product_
 - Streamable HTTP transport, bearer-token auth, loopback-only default bind, optional CORS.
 - `MCP_READ_ONLY` and `MCP_ENABLE_RAW_API` policy filters. FR-5.2, FR-5.3, FR-6, NFR-1.
 
+## Phase 6 — Supplier recurring invoice templates (done)
+
+- `get_supplier_invoice_templates` / `get_supplier_invoice_template` / `update_supplier_invoice_template`
+  / `update_supplier_invoice_template_line` against the would-be `supplierinvoices/templates` REST route,
+  with an actionable structured error on instances without the endpoint (stock Dolibarr ships none;
+  UI-only via `fourn/facture/card-rec.php`). FR-8. Use case: annual rent revision (ILAT, 1 December).
+
 ## Later / on demand
 
 - Additional Dolibarr resources not yet wrapped (e.g. proposals, bank accounts, stock).

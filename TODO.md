@@ -36,14 +36,16 @@ recorded in git history and CHANGELOG.md).
   needed for released versions.
 - [ ] When all sub-issues are done: refresh the local skill and `SPECIFICATION.md`, then commit
   `.gitignore`, `SPECIFICATION.md`, `.agents/` (and the planning docs) and push `feat/issue-37`.
-- [ ] MCP tools for supplier recurring invoice templates (`llx_facture_fourn_rec` /
-  `llx_facture_fourn_det_rec`, classes `FactureFournisseurRec` / `FactureFournisseurLigneRec`):
-  list per supplier, read, and update (template title/label, `ref_supplier`, line unit prices and
-  quantities). Dolibarr 21 exposes no REST endpoint for these objects (only customer templates via
+- [x] MCP tools for supplier recurring invoice templates (`llx_facture_fourn_rec` /
+  `llx_facture_fourn_det_rec`, classes `FactureFournisseurRec` / `FactureFournisseurLigneRec`): list per
+  supplier, read, and update (template title/label, `ref_supplier`, line unit prices and quantities).
+  Dolibarr 21 exposes no REST endpoint for these objects (only customer templates via
   `/invoices/templates`); each generated draft copies title/label, `ref_supplier` and line
   prices/quantities from the template, and the template is editable only via the UI
-  (`fourn/facture/card-rec.php`). Use case: annual rent revision (ILAT, 1 December) — the December
-  draft is generated with the pre-revision amount and the template cannot be updated via the API.
+  (`fourn/facture/card-rec.php`). Use case: annual rent revision (ILAT, 1 December) — the December draft
+  is generated with the pre-revision amount and the template cannot be updated via the API. DONE (FR-8):
+  tools call the would-be `supplierinvoices/templates` route and degrade with an actionable error where
+  the endpoint is absent; no DB layer added.
 
 ## Notes
 

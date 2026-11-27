@@ -120,6 +120,25 @@ unhandled exceptions.
 - FR-7.12 Agenda: `create_agenda_event` (`type_code` via dictionary, e.g. AC_TEL), `get_agenda_event`;
   `contact_id` is not persisted upstream (11).
 
+### FR-8 — Supplier recurring invoice templates
+
+- FR-8.1: `get_supplier_invoice_templates` lists templates (llx_facture_fourn_rec), optionally per
+  supplier (`supplier_id` → `sqlfilters (t.fk_soc:=:N)`), as compact rows (id, ref, title, ref_supplier,
+  socid).
+- FR-8.2: `get_supplier_invoice_template` returns one template with its lines (llx_facture_fourn_det_rec)
+  as compact rows (id, description, pu_ht, qty, tva_tx).
+- FR-8.3: `update_supplier_invoice_template` updates title (label alias) and `ref_supplier`;
+  `update_supplier_invoice_template_line` updates a line's `pu_ht`/`qty` with read-merge-PUT (a PUT
+  resets unsent fields).
+- FR-8.4 Endpoint availability: stock Dolibarr (21.0.0, 24.0.4, upstream develop) exposes no REST route
+  for these objects (only customer templates via `/invoices/templates`). The tools call the would-be
+  `supplierinvoices/templates` route; when it is absent — HTTP 404/501, or 400 "invalid value specified
+  for `id`" because the router falls through to `supplierinvoices/{id}` (verified on 21.0.0 and 24.0.4) —
+  they return a structured error naming the missing endpoint and the UI path
+  (`fourn/facture/card-rec.php`), and start working automatically once a release ships the endpoint. No
+  DB access layer is added — the server stays a pure REST client. Integration tests skip on those
+  statuses (same guard pattern as FR-7.7).
+
 ## Data model
 
 The server is stateless; it holds only:

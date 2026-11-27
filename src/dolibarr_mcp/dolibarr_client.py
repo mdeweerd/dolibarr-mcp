@@ -1187,6 +1187,115 @@ class DolibarrClient:
         return await self.request("PUT", f"supplierinvoices/{invoice_id}", data=payload)
 
     # ============================================================================
+    # SUPPLIER RECURRING INVOICE TEMPLATES (llx_facture_fourn_rec / _det_rec)
+    # ============================================================================
+
+    #: Would-be REST route, mirroring the customer templates at /invoices/templates.
+    #: Stock Dolibarr (<= 24.0.4 and develop) ships no route for supplier recurring
+    #: invoice templates, so these calls degrade with an actionable error until a
+    #: release exposes them; no DB access is added for this.
+    _SUPPLIER_TEMPLATES_ENDPOINT = "supplierinvoices/templates"
+
+    @staticmethod
+    def _is_supplier_templates_absent(exc: DolibarrAPIError) -> bool:
+        """True when the answer means the templates route does not exist on this instance.
+
+        Stock Dolibarr answers 501 "API not found" for unknown API classes, 404 for
+        unknown routes — but ``supplierinvoices/templates`` falls through to the
+        ``supplierinvoices/{id}`` route and answers 400 "invalid value specified for
+        `id`", which counts as absent too.
+        """
+        if exc.status_code in (404, 501):
+            return True
+        return exc.status_code == 400 and "invalid value specified for `id`" in (exc.message or "")
+
+    async def _request_supplier_templates(self, method: str, path: str = "", **kwargs) -> Any:
+        """Call the templates endpoint, degrading with an actionable error when absent."""
+        endpoint = self._SUPPLIER_TEMPLATES_ENDPOINT if not path else f"{self._SUPPLIER_TEMPLATES_ENDPOINT}/{path.lstrip('/')}"
+        try:
+            return await self.request(method, endpoint, **kwargs)
+        except DolibarrAPIError as exc:
+            if self._is_supplier_templates_absent(exc):
+                raise DolibarrAPIError(
+                    message=(
+                        f"This Dolibarr instance exposes no REST endpoint for supplier recurring invoice "
+                        f"templates ({endpoint} answered HTTP {exc.status_code}: {exc.message}). Manage them "
+                        "in the Dolibarr UI (fourn/facture/card-rec.php) or upgrade to a Dolibarr release "
+                        "that ships the endpoint; these tools start working automatically once it exists."
+                    ),
+                    status_code=exc.status_code,
+                    response_data=exc.response_data,
+                ) from exc
+            raise
+
+    async def get_supplier_invoice_templates(
+        self,
+        limit: int = 100,
+        supplier_id: Optional[int] = None,
+        page: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """List supplier recurring invoice templates, optionally of one supplier (fk_soc)."""
+        params: Dict[str, Any] = {"limit": limit}
+        if supplier_id is not None:
+            params["sqlfilters"] = f"(t.fk_soc:=:{int(supplier_id)})"
+        if page:
+            params["page"] = page
+        result = await self._request_supplier_templates("GET", params=params)
+        return result if isinstance(result, list) else []
+
+    async def get_supplier_invoice_template(self, template_id: int) -> Dict[str, Any]:
+        """Get one supplier recurring invoice template with its lines attached."""
+        template = await self._request_supplier_templates("GET", str(template_id))
+        lines = await self._request_supplier_templates("GET", f"{template_id}/lines")
+        if isinstance(template, dict):
+            template["lines"] = lines if isinstance(lines, list) else []
+        return template
+
+    async def update_supplier_invoice_template(
+        self,
+        template_id: int,
+        data: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Update a supplier recurring invoice template (title/label, ref_supplier)."""
+        payload = self._merge_payload(data, **kwargs)
+        if "label" in payload:
+            payload.setdefault("title", payload.pop("label"))
+        return await self._request_supplier_templates("PUT", str(template_id), data=payload)
+
+    async def update_supplier_invoice_template_line(
+        self,
+        template_id: int,
+        line_id: int,
+        data: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Update a line of a supplier recurring invoice template (pu_ht, qty).
+
+        As on supplier invoice lines, a PUT resets every field not sent, so the
+        current line is read first and changes are merged in.
+        """
+        changes = self._merge_payload(data, **kwargs)
+        lines = await self._request_supplier_templates("GET", f"{template_id}/lines")
+        lines_list: List[Dict[str, Any]] = lines if isinstance(lines, list) else []
+        current = next(
+            (line for line in lines_list if str(line.get("id") or line.get("rowid")) == str(line_id)),
+            None,
+        )
+        if current is None:
+            raise DolibarrAPIError(
+                message=f"Line {line_id} not found on supplier invoice template {template_id}",
+                status_code=404,
+            )
+        payload = {
+            field: current.get(field)
+            for field in ("description", "pu_ht", "qty", "tva_tx")
+            if current.get(field) not in (None, "")
+        }
+        payload.update(changes)
+        return await self._request_supplier_templates("PUT", f"{template_id}/lines/{line_id}", data=payload)
+
+    # ============================================================================
     # PAYMENTS
     # ============================================================================
 

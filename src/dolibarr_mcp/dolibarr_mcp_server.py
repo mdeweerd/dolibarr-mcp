@@ -148,6 +148,28 @@ def _summarize_supplier_invoice(invoice: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _summarize_supplier_invoice_template(template: dict[str, Any]) -> dict[str, Any]:
+    """Compact summary of a supplier recurring invoice template (raw objects are large)."""
+    return {
+        "id": _to_int(template.get("id", template.get("rowid"))),
+        "ref": template.get("ref"),
+        "title": template.get("title", template.get("titre")),
+        "ref_supplier": template.get("ref_supplier") or None,
+        "socid": _to_int(template.get("socid", template.get("fk_soc"))),
+    }
+
+
+def _summarize_supplier_invoice_template_line(line: dict[str, Any]) -> dict[str, Any]:
+    """Compact view of a supplier recurring invoice template line."""
+    return {
+        "id": _to_int(line.get("id", line.get("rowid"))),
+        "description": line.get("description", line.get("desc")),
+        "pu_ht": line.get("pu_ht"),
+        "qty": line.get("qty"),
+        "tva_tx": line.get("tva_tx"),
+    }
+
+
 def _summarize_bank_account(account: dict[str, Any]) -> dict[str, Any]:
     """Keep only id/label/bank of a bank account (raw objects are ~10 KB each)."""
     return {
@@ -1457,6 +1479,94 @@ def _all_tools():
                     "comment": {"type": "string", "description": "Private note (optional)"},
                 },
                 "required": ["invoice_id", "amount", "payment_mode"],
+                "additionalProperties": False,
+            },
+        ),
+        # Supplier Recurring Invoice Templates
+        Tool(
+            name="get_supplier_invoice_templates",
+            description=(
+                "List supplier recurring invoice templates (llx_facture_fourn_rec), optionally of one "
+                "supplier, as compact rows. Stock Dolibarr exposes no REST endpoint for these objects: "
+                "on instances without it the call returns an explicit error pointing at the UI "
+                "(fourn/facture/card-rec.php), and it starts working automatically once a Dolibarr "
+                "release ships the endpoint."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "supplier_id": {
+                        "type": "integer",
+                        "description": "Only templates of this supplier (Dolibarr socid).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of templates per page (default: 100, max: 200).",
+                        "default": 100,
+                        "minimum": 1,
+                        "maximum": 200,
+                    },
+                    "page": {
+                        "type": "integer",
+                        "description": "Zero-based page number (default: 0).",
+                        "default": 0,
+                        "minimum": 0,
+                    },
+                },
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="get_supplier_invoice_template",
+            description=(
+                "Get one supplier recurring invoice template with its lines (description, pu_ht, qty, "
+                "tva_tx). Generated drafts copy title, ref_supplier and the line prices/quantities from "
+                "the template. Same endpoint-availability caveat as get_supplier_invoice_templates."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "template_id": {"type": "integer", "description": "Supplier recurring invoice template ID"},
+                },
+                "required": ["template_id"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="update_supplier_invoice_template",
+            description=(
+                "Update a supplier recurring invoice template: title (label) and/or ref_supplier (the "
+                "supplier's own reference on generated drafts). Same endpoint-availability caveat as "
+                "get_supplier_invoice_templates."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "template_id": {"type": "integer", "description": "Supplier recurring invoice template ID"},
+                    "title": {"type": "string", "description": "New template title (label)"},
+                    "label": {"type": "string", "description": "Alias for title"},
+                    "ref_supplier": {"type": "string", "description": "New supplier reference"},
+                },
+                "required": ["template_id"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="update_supplier_invoice_template_line",
+            description=(
+                "Update a line of a supplier recurring invoice template: pu_ht (unit price net) and/or "
+                "qty. Only the given fields change; the others keep their current values. Same "
+                "endpoint-availability caveat as get_supplier_invoice_templates."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "template_id": {"type": "integer", "description": "Supplier recurring invoice template ID"},
+                    "line_id": {"type": "integer", "description": "Template line ID to update"},
+                    "pu_ht": {"type": "number", "description": "New unit price (net)"},
+                    "qty": {"type": "number", "description": "New quantity"},
+                },
+                "required": ["template_id", "line_id"],
                 "additionalProperties": False,
             },
         ),
@@ -2881,6 +2991,29 @@ async def handle_call_tool(name: str, arguments: dict):
             elif name == "pay_supplier_invoice":
                 invoice_id = arguments.pop("invoice_id")
                 result = await client.pay_supplier_invoice(invoice_id, **arguments)
+
+            # Supplier Recurring Invoice Templates
+            elif name == "get_supplier_invoice_templates":
+                templates = await client.get_supplier_invoice_templates(
+                    limit=max(1, min(int(arguments.get("limit", 100)), 200)),
+                    supplier_id=arguments.get("supplier_id"),
+                    page=max(0, int(arguments.get("page", 0))),
+                )
+                result = [_summarize_supplier_invoice_template(t) for t in templates]
+
+            elif name == "get_supplier_invoice_template":
+                template = await client.get_supplier_invoice_template(arguments["template_id"])
+                result = _summarize_supplier_invoice_template(template)
+                result["lines"] = [_summarize_supplier_invoice_template_line(line) for line in template.get("lines", [])]
+
+            elif name == "update_supplier_invoice_template":
+                template_id = arguments.pop("template_id")
+                result = await client.update_supplier_invoice_template(template_id, **arguments)
+
+            elif name == "update_supplier_invoice_template_line":
+                template_id = arguments.pop("template_id")
+                line_id = arguments.pop("line_id")
+                result = await client.update_supplier_invoice_template_line(template_id, line_id, **arguments)
 
             # Bank Management
             elif name == "get_bank_accounts":
